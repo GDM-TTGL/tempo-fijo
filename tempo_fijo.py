@@ -87,8 +87,8 @@ def analyze_track(path: Path, progress=None) -> TrackAnalysis:
     estimates: list[tuple[float, float, float]] = []
     for start in np.arange(0.0, max(0.0, duration - 2.0), step):
         end = min(duration, start + window)
-        piece = mono[int(start * sr):int(end * sr)]
-        if len(piece) < sr * 4:
+        piece = mono[int(start * analysis_sr):int(end * analysis_sr)]
+        if len(piece) < analysis_sr * 4:
             continue
         tempo = librosa.beat.tempo(y=piece, sr=analysis_sr, aggregate=np.median)
         bpm = float(np.asarray(tempo).reshape(-1)[0])
