@@ -97,7 +97,7 @@ def analyze_track(path: Path, progress=None) -> TrackAnalysis:
 
 
 def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float, progress=None):
-    """Warp each detected beat interval to one target beat duration, preserving pitch."""
+    """Warp groups of four beats to the target tempo while preserving pitch."""
     librosa, np, _, _ = load_audio_tools()
     audio = analysis.audio
     if audio.ndim == 1:
@@ -107,18 +107,31 @@ def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float,
     marks.extend(float(t) for t in analysis.beat_times if start + 0.025 < t < end - 0.025)
     marks.append(float(end))
     marks = sorted(set(marks))
+    intervals = list(zip(marks, marks[1:]))
     out = []
-    for i, (left, right) in enumerate(zip(marks, marks[1:])):
+
+    def get_chunk(left: float, right: float):
         a = max(0, int(left * analysis.sample_rate))
         b = min(audio.shape[-1], int(right * analysis.sample_rate))
-        chunk = audio[:, a:b]
+        return audio[:, a:b]
+
+    if len(intervals) < 2:
+        raise RuntimeError("No hay audio suficiente en el tramo seleccionado.")
+
+    # Leave the unmetered lead-in and tail at their original speed.
+    out.append(get_chunk(*intervals[0]))
+    phrase_beats = 4
+    core_stop = len(intervals) - 1
+    beat_index = 1
+    while beat_index < core_stop:
+        group_stop = min(beat_index + phrase_beats, core_stop)
+        left = intervals[beat_index][0]
+        right = intervals[group_stop - 1][1]
+        chunk = get_chunk(left, right)
         if chunk.shape[-1] < 32:
+            beat_index = group_stop
             continue
-        if i == 0 or i == len(marks) - 2:
-            # Keep intro/outro outside the detected beat grid at their original length.
-            expected = chunk.shape[-1]
-        else:
-            expected = target_len
+        expected = target_len * (group_stop - beat_index)
         rate = chunk.shape[-1] / expected
         rate = min(2.0, max(0.5, rate))
         stretched = librosa.effects.time_stretch(chunk, rate=rate, n_fft=2048, hop_length=512)
@@ -127,12 +140,15 @@ def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float,
         elif stretched.shape[-1] < expected:
             stretched = np.pad(stretched, ((0, 0), (0, expected - stretched.shape[-1])))
         out.append(stretched)
-        if progress and i % 32 == 0:
-            progress(f"Alineando pulso {i + 1} de {len(marks) - 1}…")
+        if progress:
+            progress(f"Alineando frase hasta el pulso {group_stop} de {len(intervals)}…")
+        beat_index = group_stop
+
+    out.append(get_chunk(*intervals[-1]))
     if not out:
         raise RuntimeError("No hay audio suficiente en el tramo seleccionado.")
     # Short edge fades soften boundaries without shortening the target beat intervals.
-    fade = max(32, int(analysis.sample_rate * 0.012))
+    fade = max(32, int(analysis.sample_rate * 0.02))
     merged = out[0]
     for piece in out[1:]:
         n = min(fade, merged.shape[-1], piece.shape[-1])
@@ -209,6 +225,21 @@ def format_time(seconds: float) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def parse_minute_second(value: str) -> int:
+    """Read a transition point as m:ss, such as 2:34."""
+    parts = value.strip().split(":")
+    if len(parts) not in (1, 2):
+        raise ValueError("Usa el formato minuto:segundo, por ejemplo 2:34.")
+    try:
+        minutes = int(parts[0])
+        seconds = int(parts[1]) if len(parts) == 2 else 0
+    except ValueError as exc:
+        raise ValueError("Usa el formato minuto:segundo, por ejemplo 2:34.") from exc
+    if minutes < 0 or not 0 <= seconds < 60:
+        raise ValueError("Usa el formato minuto:segundo, por ejemplo 2:34.")
+    return minutes * 60 + seconds
+
+
 class TempoFijoApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -220,7 +251,7 @@ class TempoFijoApp(tk.Tk):
         self.mode_var = tk.StringVar(value="analyze")
         self.bpm_var = tk.StringVar(value="128")
         self.bpm2_var = tk.StringVar(value="126")
-        self.change_var = tk.StringVar(value="60")
+        self.change_var = tk.StringVar(value="1:00")
         self.status_var = tk.StringVar(value="Selecciona un MP3 para comenzar.")
         self.events: queue.Queue = queue.Queue()
         self.busy = False
@@ -266,7 +297,7 @@ class TempoFijoApp(tk.Tk):
         ttk.Entry(self.transition_row, textvariable=self.bpm_var, width=8).pack(side="left", padx=6)
         ttk.Label(self.transition_row, text="Segundo BPM:").pack(side="left", padx=(8, 0))
         ttk.Entry(self.transition_row, textvariable=self.bpm2_var, width=8).pack(side="left", padx=6)
-        ttk.Label(self.transition_row, text="Cambio en segundo:").pack(side="left", padx=(8, 0))
+        ttk.Label(self.transition_row, text="Cambio en el minuto:").pack(side="left", padx=(8, 0))
         ttk.Entry(self.transition_row, textvariable=self.change_var, width=8).pack(side="left", padx=6)
         ttk.Label(settings, text="Se conserva el tono. El original no se modifica; el MP3 corregido se guarda como copia.",
                   foreground="#555555").pack(anchor="w", pady=(10, 0))
@@ -337,11 +368,11 @@ class TempoFijoApp(tk.Tk):
         try:
             bpm1 = float(self.bpm_var.get())
             bpm2 = float(self.bpm2_var.get())
-            change = float(self.change_var.get())
+            change = parse_minute_second(self.change_var.get())
             if not 40 <= bpm1 <= 240 or not 40 <= bpm2 <= 240:
                 raise ValueError("Los BPM deben estar entre 40 y 240.")
             if change <= 0:
-                raise ValueError("El punto de cambio debe ser un segundo mayor que cero.")
+                raise ValueError("El cambio debe ser después de 00:00.")
         except ValueError as exc:
             messagebox.showerror(APP_TITLE, f"Revisa los parámetros: {exc}")
             return
@@ -352,7 +383,7 @@ class TempoFijoApp(tk.Tk):
         self._set_result("")
         threading.Thread(target=self._worker, args=(source, mode, bpm1, bpm2, change), daemon=True).start()
 
-    def _worker(self, source: Path, mode: str, bpm1: float, bpm2: float, change: float):
+    def _worker(self, source: Path, mode: str, bpm1: float, bpm2: float, change: int):
         try:
             def progress(message):
                 self.events.put(("status", message))
@@ -373,7 +404,7 @@ class TempoFijoApp(tk.Tk):
                 output = local_conform(analysis, bpm1, 0.0, analysis.duration, progress)
             else:
                 if change >= analysis.duration - 1:
-                    raise RuntimeError("El punto de cambio debe quedar antes del final de la canción.")
+                    raise RuntimeError("El cambio debe quedar antes del final de la canción.")
                 cut_idx = max(0, min(len(analysis.beat_times) - 1,
                                      next((i for i, t in enumerate(analysis.beat_times) if t >= change), len(analysis.beat_times) - 1)))
                 cut = float(analysis.beat_times[cut_idx])
