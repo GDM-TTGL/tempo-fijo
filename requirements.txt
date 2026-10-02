@@ -1,0 +1,4 @@
+librosa>=0.10.2
+numpy>=1.26
+miniaudio>=1.72
+lameenc>=1.8
