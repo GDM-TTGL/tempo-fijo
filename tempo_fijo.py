@@ -98,7 +98,7 @@ def analyze_track(path: Path, progress=None) -> TrackAnalysis:
 
 def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float, progress=None):
     """Conform each detected beat and join it with a short WSOLA crossfade."""
-    _, np, _, _ = load_audio_tools()
+    librosa, np, _, _ = load_audio_tools()
     try:
         from audiotsm import wsola
         from audiotsm.io.array import ArrayReader, ArrayWriter
@@ -145,15 +145,30 @@ def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float,
             )
         reader = ArrayReader(source)
         writer = ArrayWriter(audio.shape[0])
-        wsola(audio.shape[0], speed=speed, frame_length=1024).run(reader, writer)
+        # A smaller synthesis hop gives much finer output-length resolution than
+        # WSOLA's default 512-sample steps, which are too coarse for beat-sized blocks.
+        wsola(audio.shape[0], speed=speed, frame_length=1024, synthesis_hop=128).run(reader, writer)
         stretched = np.asarray(writer.data, dtype=np.float32)
         error = expected - stretched.shape[-1]
-        if abs(error) > max(256, int(analysis.sample_rate * 0.015)):
-            raise RuntimeError("El procesador no pudo ajustar un pulso con precisión; no exporté un audio irregular.")
-        if error > 0:
-            stretched = np.pad(stretched, ((0, 0), (0, error)))
-        elif error < 0:
-            stretched = stretched[:, :expected]
+        if stretched.shape[-1] < 64 or abs(error) > expected * 0.08:
+            raise RuntimeError(
+                f"No pude ajustar el pulso cerca de {int(left // 60):02d}:{int(left % 60):02d} "
+                "sin alterar demasiado su duración. Prueba otro BPM objetivo o revisa el análisis de pulsos."
+            )
+        if error:
+            # WSOLA outputs integral synthesis hops, so a beat may miss the exact
+            # sample count by a few milliseconds. Resample only that small delta
+            # instead of padding with silence or cutting audio at every beat.
+            stretched = librosa.resample(
+                stretched, orig_sr=stretched.shape[-1], target_sr=expected, axis=-1, res_type="soxr_hq"
+            )
+            length_error = expected - stretched.shape[-1]
+            if abs(length_error) > 2:
+                raise RuntimeError("No se pudo cerrar con precisión la duración de un pulso.")
+            if length_error > 0:
+                stretched = np.pad(stretched, ((0, 0), (0, length_error)), mode="edge")
+            elif length_error < 0:
+                stretched = stretched[:, :expected]
         chunks.append(stretched)
         if progress:
             progress(f"Alineando pulso {index + 1} de {len(beat_intervals)}…")
