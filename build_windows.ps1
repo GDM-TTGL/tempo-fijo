@@ -22,7 +22,7 @@ $VenvPython = Join-Path $Project ".build-venv\Scripts\python.exe"
 if ($LASTEXITCODE -ne 0) { throw "Could not install build dependencies." }
 
 & $VenvPython -m PyInstaller --noconfirm --clean --onedir --windowed --name TempoFijo `
-    --collect-all librosa --collect-all miniaudio --collect-all lameenc `
+    --collect-all librosa --collect-all miniaudio --collect-all lameenc --collect-all audiotsm `
     --add-data "release_config.json;." tempo_fijo.py
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller could not package Tempo Fijo." }
 

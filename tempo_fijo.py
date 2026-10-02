@@ -97,66 +97,83 @@ def analyze_track(path: Path, progress=None) -> TrackAnalysis:
 
 
 def local_conform(analysis: TrackAnalysis, bpm: float, start: float, end: float, progress=None):
-    """Warp groups of four beats to the target tempo while preserving pitch."""
-    librosa, np, _, _ = load_audio_tools()
+    """Conform each detected beat and join it with a short WSOLA crossfade."""
+    _, np, _, _ = load_audio_tools()
+    try:
+        from audiotsm import wsola
+        from audiotsm.io.array import ArrayReader, ArrayWriter
+    except ImportError as exc:
+        raise RuntimeError("Falta el procesador de audio. Reinstala Tempo Fijo con el instalador más reciente.") from exc
     audio = analysis.audio
     if audio.ndim == 1:
         audio = audio[np.newaxis, :]
     target_len = max(1, round(analysis.sample_rate * 60.0 / bpm))
-    marks = [float(start)]
-    marks.extend(float(t) for t in analysis.beat_times if start + 0.025 < t < end - 0.025)
-    marks.append(float(end))
-    marks = sorted(set(marks))
-    intervals = list(zip(marks, marks[1:]))
-    out = []
+    fade = max(64, round(analysis.sample_rate * 0.008))
+    beat_times = [float(t) for t in analysis.beat_times if start - 0.025 <= t <= end + 0.025]
+    anchors = []
+    for t in beat_times:
+        t = min(end, max(start, t))
+        if not anchors or t - anchors[-1] > 0.025:
+            anchors.append(t)
+    if len(anchors) < 2:
+        raise RuntimeError("No detecté dos pulsos dentro del tramo que quieres corregir.")
+
+    lead_end = anchors[0]
+    tail_start = anchors[-1]
+    chunks = []
 
     def get_chunk(left: float, right: float):
         a = max(0, int(left * analysis.sample_rate))
         b = min(audio.shape[-1], int(right * analysis.sample_rate))
         return audio[:, a:b]
 
-    if len(intervals) < 2:
-        raise RuntimeError("No hay audio suficiente en el tramo seleccionado.")
+    # Keep the lead-in before the first beat and the tail after the last beat intact.
+    if lead_end > start:
+        chunks.append(get_chunk(start, lead_end))
 
-    # Leave the unmetered lead-in and tail at their original speed.
-    out.append(get_chunk(*intervals[0]))
-    phrase_beats = 4
-    core_stop = len(intervals) - 1
-    beat_index = 1
-    while beat_index < core_stop:
-        group_stop = min(beat_index + phrase_beats, core_stop)
-        left = intervals[beat_index][0]
-        right = intervals[group_stop - 1][1]
-        chunk = get_chunk(left, right)
-        if chunk.shape[-1] < 32:
-            beat_index = group_stop
-            continue
-        expected = target_len * (group_stop - beat_index)
-        rate = chunk.shape[-1] / expected
-        rate = min(2.0, max(0.5, rate))
-        stretched = librosa.effects.time_stretch(chunk, rate=rate, n_fft=2048, hop_length=512)
-        if stretched.shape[-1] > expected:
+    beat_intervals = list(zip(anchors, anchors[1:]))
+    for index, (left, right) in enumerate(beat_intervals):
+        source = get_chunk(left, right)
+        if source.shape[-1] < 512:
+            raise RuntimeError("Un pulso quedó demasiado corto para corregirlo con buena calidad.")
+        expected = target_len + (fade if index < len(beat_intervals) - 1 else 0)
+        speed = source.shape[-1] / expected
+        if not 0.5 <= speed <= 2.0:
+            raise RuntimeError(
+                f"El pulso cerca de {int(left // 60):02d}:{int(left % 60):02d} requiere un cambio extremo. "
+                "Revisa el BPM objetivo o la detección de pulsos; no exporté una copia degradada."
+            )
+        reader = ArrayReader(source)
+        writer = ArrayWriter(audio.shape[0])
+        wsola(audio.shape[0], speed=speed, frame_length=1024).run(reader, writer)
+        stretched = np.asarray(writer.data, dtype=np.float32)
+        error = expected - stretched.shape[-1]
+        if abs(error) > max(256, int(analysis.sample_rate * 0.015)):
+            raise RuntimeError("El procesador no pudo ajustar un pulso con precisión; no exporté un audio irregular.")
+        if error > 0:
+            stretched = np.pad(stretched, ((0, 0), (0, error)))
+        elif error < 0:
             stretched = stretched[:, :expected]
-        elif stretched.shape[-1] < expected:
-            stretched = np.pad(stretched, ((0, 0), (0, expected - stretched.shape[-1])))
-        out.append(stretched)
+        chunks.append(stretched)
         if progress:
-            progress(f"Alineando frase hasta el pulso {group_stop} de {len(intervals)}…")
-        beat_index = group_stop
+            progress(f"Alineando pulso {index + 1} de {len(beat_intervals)}…")
 
-    out.append(get_chunk(*intervals[-1]))
-    if not out:
+    if tail_start < end:
+        chunks.append(get_chunk(tail_start, end))
+    if not chunks:
         raise RuntimeError("No hay audio suficiente en el tramo seleccionado.")
-    # Short edge fades soften boundaries without shortening the target beat intervals.
-    fade = max(32, int(analysis.sample_rate * 0.02))
-    merged = out[0]
-    for piece in out[1:]:
+
+    # Real overlap-add preserves the beat grid; the previous version faded each
+    # phrase to silence and then concatenated it, which caused audible dips.
+    merged = chunks[0]
+    for piece in chunks[1:]:
         n = min(fade, merged.shape[-1], piece.shape[-1])
         if n:
-            x = np.linspace(0.0, np.pi / 2.0, n, endpoint=False)
-            merged[:, -n:] *= np.cos(x)[None, :]
-            piece[:, :n] *= np.sin(x)[None, :]
-        merged = np.concatenate((merged, piece), axis=1)
+            x = np.linspace(0.0, np.pi / 2.0, n, endpoint=False, dtype=np.float32)
+            blend = merged[:, -n:] * np.cos(x)[None, :] + piece[:, :n] * np.sin(x)[None, :]
+            merged = np.concatenate((merged[:, :-n], blend, piece[:, n:]), axis=1)
+        else:
+            merged = np.concatenate((merged, piece), axis=1)
     return merged
 
 

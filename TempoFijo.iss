@@ -29,6 +29,7 @@ Name: "desktopicon"; Description: "Crear un acceso directo en el escritorio"; Gr
 
 [Files]
 Source: "dist\TempoFijo\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

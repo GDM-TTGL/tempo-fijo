@@ -2,3 +2,4 @@ librosa>=0.10.2
 numpy>=1.26
 miniaudio>=1.71
 lameenc>=1.8
+audiotsm==0.1.2
